@@ -25,7 +25,7 @@ SCORE_PROMPT_TEMPLATE = """You are a job fit evaluator. Given a candidate's resu
 THE CANDIDATE: {candidate_summary}
 
 ⚠️ GEOGRAPHY CHECK — DO THIS FIRST, BEFORE ANYTHING ELSE:
-The candidate is US-based (Seattle, WA). Any role restricted to non-US geography is INELIGIBLE.
+The candidate is US-based ({home_location}). Any role restricted to non-US geography is INELIGIBLE.
 Read the FULL description for buried sentences like "This role will be remote and based in the UK"
 or "Remote — Ontario, BC or Alberta". A perfect tech stack on a non-US role is still INELIGIBLE.
 
@@ -44,7 +44,7 @@ If non_us_only, you MAY still produce a SCORE based on tech-stack fit (for audit
 eligibility tag is what determines whether the application proceeds.
 
 SCORING CRITERIA:
-- 10: Near-perfect IC engineering match. The role is a software/platform/infrastructure engineer position requiring the candidate's exact stack (Go/Kotlin/Python/Java, distributed systems, K8s). Seniority aligns (Senior/Staff/Principal). The candidate would be a top-tier applicant with minimal gaps.
+- 10: Near-perfect IC engineering match. The role is one of the candidate's target roles ({target_role}) requiring the candidate's exact stack ({primary_stack}). Seniority aligns (Senior/Staff/Principal). The candidate would be a top-tier applicant with minimal gaps.
 - 9: Excellent engineering match. Strong alignment on tech stack and seniority, with 1-2 gaps in secondary skills or slightly different domain.
 - 7-8: Good engineering match. Candidate has most required technical skills. Minor gaps in specific frameworks or domain experience, easily bridged.
 - 5-6: Moderate match. The role is engineering but uses a different primary stack, or there's a seniority mismatch (e.g., junior role or executive-only role with no IC component).
@@ -55,7 +55,7 @@ ADDITIONAL RULES:
 - Non-engineering roles (recruiters, designers, PMs, marketing, sales, executive search) score 1-2 MAX regardless of seniority or domain.
 - Roles requiring a specific language the candidate doesn't know (Rust, C++, Ruby, Scala, Clojure) as the PRIMARY requirement score 4-6 max depending on transferability.
 - "CTO" or "VP Engineering" roles that are purely management with no IC engineering component score 5-6 max.
-- LOCATION is N/A: check the description for any office/city requirement. If the description implies onsite in a specific US city outside Seattle/Bellevue/Kirkland/Redmond, cap at 7.
+- LOCATION is N/A: check the description for any office/city requirement. If the description implies onsite in a specific US city outside the candidate's acceptable area ({acceptable_locations}), cap at 7.
 - Distinguish REQUIRED skills from NICE-TO-HAVE. Only penalize for missing required skills.
 - Value transferable experience: workflow orchestration, distributed systems, microservices, developer platforms transfer across domains.
 
@@ -100,11 +100,11 @@ _INELIGIBLE_TITLE_PATTERNS = re.compile(
     r'|\bNew[- ]Grad\b'
     r'|\bTrainee\b'
     r'|\bApprentice\b'
-    # Sales-adjacency (not IC engineering)
-    r'|\bSales Engineer\b'
-    r'|\bSolutions Engineer\b'
-    r'|\bPre[- ]?[Ss]ales\b'
-    r'|\bCustomer Success Engineer\b'
+    # NOTE: Sales Engineer / Solutions Engineer / Pre-sales / Customer Success
+    # Engineer used to be hard-rejected here. Moved to _SALES_ADJACENT_PATTERNS
+    # (below) which is only applied when the profile's target_role does NOT
+    # include those titles — for solutions-engineering candidates they're the
+    # whole point.
     # Retail / warehouse / service roles (filter out Costco + similar noise)
     r'|\bCashier\b|\bBaker\b|\bCake Decorator\b|\bButcher\b|\bMeat Cutter\b'
     r'|\bGas Station Attendant\b|\bPharmacy Technician\b|\bHearing Aid Dispenser\b'
@@ -125,6 +125,26 @@ _INELIGIBLE_TITLE_PATTERNS = re.compile(
     r'|\bMainframe Engineer\b|\bCOBOL Developer\b|\bTIBCO\b',
     re.IGNORECASE,
 )
+
+# Sales-adjacent titles. Skipped for candidates whose profile target_role
+# mentions solutions/sales engineering; hard-rejected otherwise.
+_SALES_ADJACENT_PATTERNS = re.compile(
+    r'\bSales Engineer\b'
+    r'|\bSolutions Engineer\b'
+    r'|\bPre[- ]?[Ss]ales\b'
+    r'|\bCustomer Success Engineer\b',
+    re.IGNORECASE,
+)
+_SALES_ADJACENT_TARGET_HINTS = ("solutions engineer", "sales engineer", "pre-sales",
+                                "presales", "customer success", "solutions architect",
+                                "forward deployed")
+
+
+def _profile_targets_sales_adjacent(profile: dict | None) -> bool:
+    target = ((profile or {}).get("experience", {}) or {}).get("target_role", "") or ""
+    t = target.lower()
+    return any(h in t for h in _SALES_ADJACENT_TARGET_HINTS)
+
 
 # Patterns checked against the location field specifically.
 # Location field explicitly lists a non-US country name → ineligible.
@@ -185,19 +205,25 @@ _INELIGIBLE_DESC_PATTERNS = re.compile(
 _DESC_SCAN_CHARS = 6000
 
 
-def _check_ineligible(job: dict) -> str | None:
-    """Return an ineligibility reason if the job is obviously non-US, else None.
+def _check_ineligible(job: dict, profile: dict | None = None) -> str | None:
+    """Return an ineligibility reason if the job is obviously a non-fit, else None.
 
     Checked before the LLM call to save tokens and ensure consistency.
     Scans title, location field, and the first ``_DESC_SCAN_CHARS`` of the
-    description.
+    description. Title matches cover non-US regions, seniority mismatches,
+    and non-engineering roles; the reason string names the matched token.
     """
     title = job.get("title") or ""
     location = job.get("location") or ""
     desc_head = (job.get("full_description") or "")[:_DESC_SCAN_CHARS]
 
-    if _INELIGIBLE_TITLE_PATTERNS.search(title):
-        return f"non-US geography in title: {title}"
+    m = _INELIGIBLE_TITLE_PATTERNS.search(title)
+    if m:
+        return f"title pattern '{m.group(0)}': {title}"
+    if not _profile_targets_sales_adjacent(profile):
+        m = _SALES_ADJACENT_PATTERNS.search(title)
+        if m:
+            return f"sales-adjacent title '{m.group(0)}' (not in profile target_role): {title}"
     if location and _INELIGIBLE_LOCATION_PATTERNS.search(location):
         return f"non-US location field: {location}"
     m = _INELIGIBLE_DESC_PATTERNS.search(desc_head)
@@ -265,6 +291,49 @@ def _build_candidate_summary(profile: dict) -> str:
     return " ".join(parts)
 
 
+def _build_score_prompt(profile: dict) -> str:
+    """Render SCORE_PROMPT_TEMPLATE with profile- and search-config-derived values.
+
+    Nothing about the candidate's geography, stack, or target roles is
+    hardcoded — it all comes from ``profile.json`` and ``searches.yaml``.
+    """
+    from applypilot.config import load_search_config
+
+    personal = profile.get("personal", {})
+    exp = profile.get("experience", {})
+    boundary = profile.get("skills_boundary", {})
+
+    city = personal.get("city", "")
+    state = personal.get("province_state", "")
+    home_location = ", ".join(p for p in (city, state) if p) or "United States"
+
+    # Primary stack: languages + first few from each other category, deduped.
+    stack: list[str] = list(boundary.get("languages", [])[:6])
+    for cat, items in boundary.items():
+        if cat == "languages" or not isinstance(items, list):
+            continue
+        for s in items[:3]:
+            if s not in stack:
+                stack.append(s)
+    primary_stack = ", ".join(stack[:18]) or "see resume"
+
+    try:
+        search_cfg = load_search_config() or {}
+    except Exception:  # pragma: no cover - config parse issues shouldn't kill scoring
+        search_cfg = {}
+    accept = (search_cfg.get("location", {}) or {}).get("accept_patterns", []) or []
+    accept = [a for a in accept if a.lower() not in ("remote", "anywhere", "united states", "us", "usa")]
+    acceptable_locations = ", ".join(accept[:12]) if accept else home_location
+
+    return SCORE_PROMPT_TEMPLATE.format(
+        candidate_summary=_build_candidate_summary(profile),
+        home_location=home_location,
+        target_role=exp.get("target_role", "Software Engineer"),
+        primary_stack=primary_stack,
+        acceptable_locations=acceptable_locations,
+    )
+
+
 def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
     """Score a single job against the resume.
 
@@ -281,19 +350,18 @@ def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
     # Rule-based pre-filter: catch obvious non-US ineligible jobs before LLM call.
     # Tags eligibility=non_us_only so downstream stages skip the job; the score
     # is still recorded so audit views can see the original LLM-style severity.
-    ineligible_reason = _check_ineligible(job)
+    ineligible_reason = _check_ineligible(job, profile)
     if ineligible_reason:
-        log.info("Pre-filter INELIGIBLE (non_us_only): %s — %s", (job.get("title") or "?")[:60], ineligible_reason)
+        log.info("Pre-filter INELIGIBLE: %s — %s", (job.get("title") or "?")[:60], ineligible_reason)
         return {
             "score": 2,
             "keywords": "",
-            "reasoning": f"Ineligible: {ineligible_reason}. Candidate is US-based.",
+            "reasoning": f"Ineligible (pre-filter): {ineligible_reason}",
             "eligibility": "non_us_only",
         }
 
     try:
-        candidate_summary = _build_candidate_summary(profile)
-        score_prompt = SCORE_PROMPT_TEMPLATE.format(candidate_summary=candidate_summary)
+        score_prompt = _build_score_prompt(profile)
 
         job_text = (
             f"TITLE: {job['title']}\n"

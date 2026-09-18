@@ -251,6 +251,7 @@ def _worker_loop_body(
 
         chrome_proc = None
         was_skipped = False
+        ats_slug = None  # set inside try; read in finally for pacing
         try:
             # Detect ATS for persistent session overlay
             apply_url = job.get("application_url") or job.get("url", "")
@@ -324,6 +325,24 @@ def _worker_loop_body(
                     _log_failed_attempt(job, reason, worker_id, duration_ms, True)
                     failed += 1
                     _stop_event.set()
+                    break
+                elif result == "dry_run_filled":
+                    # Form filled to the Submit button, nothing submitted.
+                    # Release the lock so the row stays ready_to_apply and
+                    # leave an auditable transition for the test.
+                    release_lock(job["url"])
+                    try:
+                        from applypilot.database import get_connection
+                        _c = get_connection()
+                        transition_state(_c, job["url"], "ready_to_apply",
+                                         reason="dry run: form filled, not submitted",
+                                         force=True)
+                        _c.commit()
+                    except Exception:
+                        logger.debug("dry-run transition note failed", exc_info=True)
+                    add_event(f"[W{worker_id}] Dry run done, not submitted: {(job.get('title') or '')[:30]}")
+                    update_state(worker_id, status="dry_run_filled",
+                                 last_action="dry run filled, not submitted")
                     break
                 elif result == "applied":
                     mark_result(job["url"], "applied", duration_ms=duration_ms)
@@ -455,7 +474,9 @@ def _worker_loop_body(
                         if ats_slug:
                             clear_ats_session(ats_slug)
                         nh_url = job.get("application_url") or job["url"]
-                        nh_instructions = get_hitl_instruction("login_required")
+                        nh_instructions = get_hitl_instruction(
+                            "login_required_linkedin" if ats_slug == "linkedin"
+                            else "login_required")
 
                         hitl_outcome = _run_hitl(
                             worker_id=worker_id, port=port, job=job,
@@ -521,6 +542,14 @@ def _worker_loop_body(
         finally:
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
+            # Record the attempt for per-surface pacing regardless of
+            # outcome — the server saw a session either way.
+            if not was_skipped:
+                try:
+                    from applypilot.apply import pacing as _pacing
+                    _pacing.note_attempt(ats_slug or "default")
+                except Exception:
+                    logger.debug("pacing.note_attempt failed", exc_info=True)
 
         if was_skipped:
             continue

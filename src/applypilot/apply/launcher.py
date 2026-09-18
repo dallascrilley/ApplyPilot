@@ -35,7 +35,7 @@ from applypilot.database import (
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.chrome import (  # noqa: F401  (re-exports)
     launch_chrome, cleanup_worker, kill_all_chrome,
-    detect_ats, save_ats_session, clear_ats_session,
+    detect_ats, save_ats_session, clear_ats_session, is_linkedin_listing,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT, HITL_LISTEN_BASE_PORT, bring_to_foreground,
     probe_existing_chrome, _AdoptedChromeProcess,
@@ -54,6 +54,7 @@ from applypilot.apply.result_handlers import (  # noqa: F401  (re-exports)
     _FAILED_LOG,
     _MANUAL_LOG,
     _parse_account_created,
+    _parse_external_apply_url,
     _parse_qa_lines,
     _infer_result_from_output,
     _is_permanent_failure,
@@ -1351,16 +1352,16 @@ def _refresh_gmail_token() -> bool:
 def _make_mcp_config(cdp_port: int, worker_id: int = 0) -> dict:
     """Build MCP config dict for a specific CDP port.
 
-    Passes the real Chrome user-agent to Playwright MCP so it doesn't
-    override our Chrome --user-agent flag with its default
-    "HeadlessChrome" UA when connecting via CDP.
-
-    The viewport is synced with the Chrome window size chosen for this
-    worker (see chrome._pick_viewport / get_worker_viewport).
+    Deliberately passes NEITHER --user-agent NOR --viewport-size. When
+    Playwright MCP attaches over CDP it uses the browser's default context
+    (``noDefaults: true``), so a real, headed Chrome keeps its own UA and
+    window geometry. Setting either option makes Playwright issue
+    ``Emulation.setUserAgentOverride`` / ``setDeviceMetricsOverride`` on
+    every page, which (a) empties ``navigator.userAgentData`` high-entropy
+    hints and (b) produces a viewport that doesn't match the OS window —
+    both classic automation tells. Window size is fixed at Chrome launch
+    instead (chrome._pick_viewport).
     """
-    from applypilot.apply.chrome import _get_real_user_agent, get_worker_viewport
-
-    vp = get_worker_viewport(worker_id)
     return {
         "mcpServers": {
             "playwright": {
@@ -1372,8 +1373,6 @@ def _make_mcp_config(cdp_port: int, worker_id: int = 0) -> dict:
                     # check `npm view @playwright/mcp@<v> dist.attestations.url`.
                     "@playwright/mcp@0.0.75",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    f"--viewport-size={vp[0]}x{vp[1]}",
-                    f"--user-agent={_get_real_user_agent()}",
                 ],
             },
             "gmail": {
@@ -1565,8 +1564,14 @@ def acquire_job(target_url: str | None = None,
                   AND (j.apply_status IS NULL OR j.apply_status = 'failed')
                   AND (j.apply_attempts IS NULL OR j.apply_attempts < {config.DEFAULTS["max_apply_attempts"]})
                   AND j.fit_score >= ?
-                  AND j.application_url IS NOT NULL
-                  AND j.application_url != ''
+                  AND (
+                        (j.application_url IS NOT NULL AND j.application_url != '')
+                        -- LinkedIn listings carry no external apply URL in guest
+                        -- HTML (Easy Apply, or an offsite link gated behind
+                        -- sign-in). The listing page IS the apply entry point
+                        -- when the worker has a logged-in LinkedIn session.
+                        OR (j.site = 'linkedin' AND j.url LIKE 'https://www.linkedin.com/jobs/view/%')
+                  )
                   AND (j.eligibility IS NULL OR j.eligibility = 'eligible')
                   {max_score_filter}
                   AND {site_filter}
@@ -1631,16 +1636,32 @@ def acquire_job(target_url: str | None = None,
                 ),
             )
 
-            # Pick first candidate whose company is under cap AND ATS lane is free.
+            # Pick first candidate whose company is under cap AND ATS lane is
+            # free AND whose surface is not paced-out (per-hour/day caps,
+            # randomized min gap, local active hours — see apply/pacing.py).
+            # Pacing is per-surface, so a LinkedIn cool-down does not stop
+            # Greenhouse/Lever jobs from flowing.
+            from applypilot.apply import pacing as _pacing
             row = None
+            paced_out: dict[str, str] = {}
             for cand in candidates:
                 if over_cap(dict(cand)):
                     continue
                 ats = detect_ats(cand["application_url"] or cand["url"] or "")
                 if ats is not None and ats in active_ats:
                     continue
+                surface = ats or "default"
+                if surface not in paced_out:
+                    decision = _pacing.check(conn, surface)
+                    if not decision.allowed:
+                        paced_out[surface] = decision.reason
+                if surface in paced_out:
+                    continue
                 row = cand
                 break
+            if row is None and paced_out:
+                logger.info("acquire_job: pacing hold — %s",
+                            "; ".join(paced_out.values()))
 
             if row is None and candidates:
                 logger.debug(
@@ -1655,11 +1676,11 @@ def acquire_job(target_url: str | None = None,
         from applypilot.config import is_manual_ats
 
         # Defensive: the SELECT already filters NULL/empty application_urls
-        # via WHERE, but if any path mutates the row before this point we'd
-        # rather mark it manual_only than fall through to row["url"] (the
-        # listing URL on aggregators) and have the agent try to "apply" by
-        # navigating to a LinkedIn page.
-        if not (row["application_url"] or "").strip():
+        # via WHERE (except LinkedIn listings, which are applied to from the
+        # listing page itself), but if any path mutates the row before this
+        # point we'd rather mark it manual_only than fall through to
+        # row["url"] on a non-LinkedIn aggregator.
+        if not (row["application_url"] or "").strip() and not is_linkedin_listing(row):
             conn.execute(
                 "UPDATE jobs SET apply_status = 'manual', "
                 "apply_error = 'no application_url', "
@@ -1676,7 +1697,7 @@ def acquire_job(target_url: str | None = None,
             )
             return None
 
-        apply_url = row["application_url"]
+        apply_url = row["application_url"] or row["url"]
         if is_manual_ats(apply_url):
             conn.execute(
                 "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS', "
@@ -1777,7 +1798,7 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int | None = None, max_score: int | None = None,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
+               model: str = "sonnet", worker_id: int = 0, dry_run: bool = False) -> Path | None:
     """Generate a prompt file and print the Claude CLI command for manual debugging.
 
     Returns:
@@ -1798,7 +1819,8 @@ def gen_prompt(target_url: str, min_score: int | None = None, max_score: int | N
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, worker_id=worker_id, doc_format=_doc_format)
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, worker_id=worker_id,
+                                     doc_format=_doc_format, dry_run=dry_run)
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -1996,12 +2018,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     # suspenders — even if the model ignores the prompt instruction
     # (Haiku has done this), the click never reaches a handler.
     if dry_run:
+        gate_ok = False
         try:
             from applypilot.apply.chrome import inject_dry_run_gate
-            inject_dry_run_gate(port)
+            gate_ok = bool(inject_dry_run_gate(port))
         except Exception:
-            logger.debug("dry_run gate injection failed; falling back to prompt-only",
-                         exc_info=True)
+            logger.debug("dry_run gate injection raised", exc_info=True)
+        if gate_ok:
+            logger.info("[worker-%d] dry-run submit gate installed (CDP)", worker_id)
+            add_event(f"[W{worker_id}] DRY RUN: submit gate installed")
+        else:
+            logger.warning("[worker-%d] dry-run submit gate NOT installed; prompt-only. "
+                           "Stay at the browser.", worker_id)
+            add_event(f"[W{worker_id}] DRY RUN: gate FAILED, prompt-only")
 
     # Wipe stale resume / cover-letter / MCP-config copies from the previous
     # job BEFORE build_prompt writes the fresh files. Earlier this wipe sat
@@ -2305,6 +2334,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # Parse ACCOUNT_CREATED lines and save to DB
         _parse_account_created(output, job.get("url"))
 
+        # Aggregator listings (LinkedIn): agent reports where the Apply
+        # button actually went so retries hit the ATS directly.
+        _parse_external_apply_url(output, job.get("url"))
+
         # Parse QA: lines and store in knowledge base
         job_url = job.get("url")
         job_ats = detect_ats(job.get("application_url") or job_url or "")
@@ -2317,6 +2350,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             if f"RESULT:{result_status}" in output:
                 # Normalize SUCCESS/ALREADY_APPLIED -> applied (already applied counts as applied)
                 canonical = "applied" if result_status in ("SUCCESS", "ALREADY_APPLIED") else result_status.lower()
+                # Dry run: the agent stopped before Submit (or was blocked by
+                # the gate). Never record this as an application.
+                if dry_run and canonical == "applied":
+                    add_event(f"[W{worker_id}] DRY RUN FILLED ({elapsed}s): {(job.get('title') or '')[:30]}")
+                    update_state(worker_id, status="dry_run_filled",
+                                 last_action=f"DRY RUN FILLED ({elapsed}s)")
+                    return "dry_run_filled", duration_ms, screening_qs
                 # Mark Q&A outcomes based on application result
                 if canonical == "applied" and job_url:
                     from applypilot.database import mark_qa_outcome
@@ -2387,6 +2427,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         # No explicit RESULT line. Try to infer the outcome from agent output.
         inferred = _infer_result_from_output(output)
+        if dry_run and inferred in ("applied", "already_applied"):
+            add_event(f"[W{worker_id}] DRY RUN FILLED (inferred, {elapsed}s): {(job.get('title') or '')[:30]}")
+            update_state(worker_id, status="dry_run_filled",
+                         last_action=f"DRY RUN FILLED (inferred, {elapsed}s)")
+            return "dry_run_filled", duration_ms, screening_qs
         if inferred in ("applied", "already_applied"):
             label = "ALREADY APPLIED" if inferred == "already_applied" else "APPLIED"
             add_event(f"[W{worker_id}] INFERRED {label} ({elapsed}s): {(job.get('title') or '')[:30]}")

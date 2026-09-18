@@ -100,100 +100,183 @@ _DRY_RUN_GATE_JS = r"""
 """
 
 
-def inject_dry_run_gate(cdp_port: int) -> bool:
-    """Install a JS gate that blocks form submits + submit-button clicks.
+class DryRunGate:
+    """Persistent CDP session that keeps the dry-run submit blocker alive.
 
-    Used when the apply pipeline runs with --dry-run. Connects to the
-    browser-level CDP target, calls Page.addScriptToEvaluateOnNewDocument
-    so the gate persists across navigations, and Runtime.evaluate the
-    same script in every existing page so it covers the current tab too.
+    ``Page.addScriptToEvaluateOnNewDocument`` is scoped to the CDP session
+    that registered it. The earlier one-shot injector attached, registered,
+    then detached, so the gate vanished on the first navigation. This class
+    holds the browser websocket open on a daemon thread, auto-attaches to
+    every page target (including tabs opened later), registers the script
+    on each, and evaluates it immediately so the current document is gated.
 
-    Earlier, dry-run was prompt-only ("don't click submit"). Haiku
-    sometimes ignored that and submitted real applications. A code-side
-    gate is non-negotiable: even if the agent fires `browser_click
-    Submit`, the click event is intercepted at the capture phase and
-    preventDefault'd before any handler runs.
-
-    Returns True on success, False on any failure (in which case the
-    caller should fall back to the prompt-only override).
+    Call ``install()`` once after Chrome is reachable; ``close()`` when the
+    worker is done. ``installed`` reports how many page targets were gated.
     """
-    import urllib.request
-    import websocket  # type: ignore
 
-    try:
-        # Browser-level WS endpoint (covers all targets via the dispatcher).
-        info = json.loads(urllib.request.urlopen(
-            f"http://localhost:{cdp_port}/json/version", timeout=3,
-        ).read())
-        browser_ws = info.get("webSocketDebuggerUrl")
-        if not browser_ws:
-            return False
-    except Exception:
-        logger.debug("dry_run_gate: could not fetch CDP /json/version", exc_info=True)
-        return False
+    def __init__(self, cdp_port: int):
+        self.port = cdp_port
+        self.ws = None
+        self.installed = 0
+        self._sessions: set[str] = set()
+        self._id = 0
+        self._lock = threading.Lock()
+        self._pending: dict[int, dict] = {}
+        self._events = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
 
-    msg_id = [0]
-
-    def _send(ws, method, params=None, session_id=None):
-        msg_id[0] += 1
-        req = {"id": msg_id[0], "method": method}
-        if params is not None:
-            req["params"] = params
-        if session_id is not None:
-            req["sessionId"] = session_id
-        ws.send(json.dumps(req))
-        # Drain until we see our response (skip events).
-        for _ in range(40):
-            raw = ws.recv()
-            try:
-                resp = json.loads(raw)
-            except Exception:
-                continue
-            if resp.get("id") == msg_id[0]:
-                return resp
+    # -- wire -------------------------------------------------------------
+    def _send(self, method, params=None, session_id=None, wait=True, timeout=5.0):
+        with self._lock:
+            self._id += 1
+            mid = self._id
+            req = {"id": mid, "method": method}
+            if params is not None:
+                req["params"] = params
+            if session_id is not None:
+                req["sessionId"] = session_id
+            self.ws.send(json.dumps(req))
+        if not wait:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if mid in self._pending:
+                    return self._pending.pop(mid)
+            self._events.wait(0.05)
+            self._events.clear()
         return None
 
-    try:
-        ws = websocket.create_connection(browser_ws, timeout=5)
-    except Exception:
-        logger.debug("dry_run_gate: ws connect failed", exc_info=True)
-        return False
-
-    try:
-        # Find every page target so we can inject into each one.
-        targets_resp = _send(ws, "Target.getTargets") or {}
-        page_targets = [
-            t for t in (targets_resp.get("result", {}).get("targetInfos", []) or [])
-            if t.get("type") == "page"
-        ]
-        installed = 0
-        for tgt in page_targets:
-            attach = _send(ws, "Target.attachToTarget",
-                           {"targetId": tgt["targetId"], "flatten": True})
-            if not attach:
-                continue
-            sid = attach.get("result", {}).get("sessionId")
-            if not sid:
-                continue
-            try:
-                _send(ws, "Page.enable", session_id=sid)
-                _send(ws, "Page.addScriptToEvaluateOnNewDocument",
-                      {"source": _DRY_RUN_GATE_JS}, session_id=sid)
-                # Also evaluate immediately so the current page is gated.
-                _send(ws, "Runtime.evaluate",
-                      {"expression": _DRY_RUN_GATE_JS, "awaitPromise": False},
-                      session_id=sid)
-                installed += 1
-            finally:
-                # Best-effort detach so we don't leave a session pinned.
-                _send(ws, "Target.detachFromTarget", {"sessionId": sid})
-        logger.info("Installed dry-run submit-blocker on %d page target(s)", installed)
-        return installed > 0
-    finally:
+    def _gate_session(self, sid: str) -> None:
+        if sid in self._sessions:
+            return
+        self._sessions.add(sid)
         try:
-            ws.close()
+            self._send("Page.enable", session_id=sid)
+            self._send("Page.addScriptToEvaluateOnNewDocument",
+                       {"source": _DRY_RUN_GATE_JS}, session_id=sid)
+            self._send("Runtime.evaluate",
+                       {"expression": _DRY_RUN_GATE_JS, "awaitPromise": False},
+                       session_id=sid)
+            self.installed += 1
+        except Exception:
+            logger.debug("dry_run_gate: gating session %s failed", sid, exc_info=True)
+
+    def _reader(self) -> None:
+        import websocket  # type: ignore
+        while not self._stop.is_set():
+            try:
+                raw = self.ws.recv()
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception:
+                break
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if "id" in msg:
+                with self._lock:
+                    self._pending[msg["id"]] = msg
+                self._events.set()
+                continue
+            method = msg.get("method")
+            params = msg.get("params") or {}
+            if method == "Target.attachedToTarget":
+                info = params.get("targetInfo") or {}
+                sid = params.get("sessionId")
+                if sid and info.get("type") == "page":
+                    threading.Thread(target=self._gate_session, args=(sid,),
+                                     daemon=True).start()
+            elif method == "Target.detachedFromTarget":
+                self._sessions.discard(params.get("sessionId"))
+
+    # -- lifecycle ----------------------------------------------------------
+    def install(self) -> bool:
+        import urllib.request
+
+        import websocket  # type: ignore
+
+        try:
+            info = json.loads(urllib.request.urlopen(
+                f"http://localhost:{self.port}/json/version", timeout=3,
+            ).read())
+            browser_ws = info.get("webSocketDebuggerUrl")
+            if not browser_ws:
+                return False
+            # Chrome 111+ rejects CDP websocket connections that carry an
+            # Origin header unless --remote-allow-origins is set. Suppress it
+            # or this returns 403 and the gate silently never installs.
+            self.ws = websocket.create_connection(browser_ws, timeout=5,
+                                                  suppress_origin=True)
+        except Exception:
+            logger.debug("dry_run_gate: connect failed", exc_info=True)
+            return False
+        self.ws.settimeout(1.0)
+        self._thread = threading.Thread(target=self._reader, daemon=True,
+                                        name=f"dry-run-gate-{self.port}")
+        self._thread.start()
+        # Auto-attach covers targets that exist now and any opened later.
+        self._send("Target.setAutoAttach",
+                   {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
+        # Existing pages: attach explicitly in case autoAttach only fires
+        # for new ones on this Chrome build.
+        resp = self._send("Target.getTargets") or {}
+        for tgt in (resp.get("result", {}).get("targetInfos", []) or []):
+            if tgt.get("type") != "page":
+                continue
+            att = self._send("Target.attachToTarget",
+                             {"targetId": tgt["targetId"], "flatten": True}) or {}
+            sid = att.get("result", {}).get("sessionId")
+            if sid:
+                self._gate_session(sid)
+        # Chrome may not have created its first tab yet (startup race).
+        # Auto-attach will gate it when it appears; wait briefly so the
+        # log line reflects reality, but a live session is enough.
+        for _ in range(20):
+            if self.installed > 0:
+                break
+            time.sleep(0.25)
+        alive = self._thread.is_alive() and not self._stop.is_set()
+        logger.info("Installed dry-run submit-blocker on %d page target(s); "
+                    "session held open, auto-attach on", self.installed)
+        return alive
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            if self.ws:
+                self.ws.close()
         except Exception:
             pass
+
+
+_dry_run_gates: dict[int, DryRunGate] = {}
+
+
+def inject_dry_run_gate(cdp_port: int) -> bool:
+    """Install (or re-install) the persistent dry-run submit gate for a port.
+
+    Returns True when at least one page target is gated. The gate stays
+    active until ``release_dry_run_gate(port)`` or the Chrome exits.
+    """
+    old = _dry_run_gates.pop(cdp_port, None)
+    if old:
+        old.close()
+    gate = DryRunGate(cdp_port)
+    ok = gate.install()
+    if ok:
+        _dry_run_gates[cdp_port] = gate
+    else:
+        gate.close()
+    return ok
+
+
+def release_dry_run_gate(cdp_port: int) -> None:
+    gate = _dry_run_gates.pop(cdp_port, None)
+    if gate:
+        gate.close()
 
 
 def _patch_manifest_key(manifest_path: Path) -> None:
@@ -298,6 +381,12 @@ SESSIONS_DIR = config.APP_DIR / "chrome-sessions"
 
 # ATS domain → slug mapping for persistent session management
 ATS_DOMAINS: dict[str, str] = {
+    # LinkedIn is not an ATS but it IS a login-gated apply surface with its
+    # own persistent session, and its Easy Apply flow must be serialized to a
+    # single worker (per-ATS lane in acquire_job). Listing URLs only — an
+    # employer's careers page that happens to link to LinkedIn won't match
+    # because detect_ats checks the hostname.
+    "linkedin.com": "linkedin",
     # --- high-volume (seen in DB) ---
     "myworkdayjobs.com": "workday",
     "greenhouse.io": "greenhouse",
@@ -350,6 +439,27 @@ def detect_ats(url: str | None) -> str | None:
     except Exception:
         pass
     return None
+
+
+def is_linkedin_listing(job) -> bool:
+    """True for a LinkedIn job-view URL with no external application_url.
+
+    These rows are applied to from the listing page itself (Easy Apply, or
+    an offsite Apply button the agent follows), so they are exempt from
+    the ``application_url IS NOT NULL`` gate in ``acquire_job``.
+    Accepts a dict or a sqlite3.Row.
+    """
+    try:
+        url = (job["url"] or "") if "url" in job.keys() else ""
+        app = (job["application_url"] or "") if "application_url" in job.keys() else ""
+        site = (job["site"] or "") if "site" in job.keys() else ""
+    except (KeyError, TypeError, AttributeError):
+        return False
+    return (
+        not app.strip()
+        and site == "linkedin"
+        and url.startswith("https://www.linkedin.com/jobs/view/")
+    )
 
 
 def get_ats_session_path(ats_slug: str) -> Path:
@@ -1011,8 +1121,22 @@ def restore_focus_mode(prev: str | None) -> None:
 
 
 def _pick_viewport() -> tuple[int, int]:
-    """Pick a random viewport from the pool."""
-    return random.choice(_VIEWPORT_POOL)
+    """Viewport for a worker window.
+
+    Stable per install, NOT random per launch. Sites that score accounts
+    on fingerprint consistency (LinkedIn especially) treat a viewport that
+    changes every session from the same cookie jar as a signal; a real
+    person's window size is boring and repeatable. Override with
+    ``APPLYPILOT_VIEWPORT=WxH``; default is the first pool entry.
+    """
+    env = os.environ.get("APPLYPILOT_VIEWPORT", "")
+    if "x" in env:
+        try:
+            w, h = env.lower().split("x", 1)
+            return int(w), int(h)
+        except ValueError:
+            pass
+    return _VIEWPORT_POOL[0]
 
 
 def get_worker_viewport(worker_id: int) -> tuple[int, int]:
@@ -1414,7 +1538,12 @@ def launch_chrome(worker_id: int, port: int | None = None,
         # Block dangerous permissions at browser level
         "--deny-permission-prompts",
         "--disable-notifications",
-        f"--user-agent={_get_real_user_agent()}",
+        # NOTE: no --user-agent. Overriding the UA makes Chrome drop the
+        # high-entropy client hints (navigator.userAgentData fullVersionList
+        # comes back EMPTY) and our synthetic "Intel Mac" string contradicts
+        # the WebGL renderer on Apple Silicon. Real Chrome's own UA + intact
+        # UA-CH is strictly less detectable. Verified 2026-09-16 against
+        # browserscan.net / sannysoft with and without the flag.
         "--disable-infobars",
     ]
 
@@ -1456,6 +1585,7 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         worker_id: Numeric worker identifier.
         process: The Popen handle (or _AdoptedChromeProcess) from launch_chrome.
     """
+    release_dry_run_gate(BASE_CDP_PORT + worker_id)
     if process and process.poll() is None:
         if process.pid:
             _kill_process_tree(process.pid)

@@ -98,6 +98,12 @@ _HITL_INSTRUCTIONS: dict[str, str] = {
         "If you don't have an account, create one. "
         "Click Done once you're logged in and on the application page."
     ),
+    "login_required_linkedin": (
+        "LOG IN to LinkedIn with your OWN account in this window (the one you "
+        "normally use). Complete any 2FA/verification yourself. Do NOT create a "
+        "new account. When the job page shows the Easy Apply / Apply button, "
+        "click Done. The session is saved and reused for future LinkedIn jobs."
+    ),
     "login_issue": (
         "LOGIN ISSUE. The agent couldn't complete login. Try logging in manually "
         "with {email} (or create an account if needed). "
@@ -664,6 +670,21 @@ def _run_hitl(
 
     # 9. Reset DB row.
     reset_needs_human(job["url"])
+
+    # 9a. If the pause was a login, persist the session NOW rather than only
+    # after a successful apply (orchestrator does that too). A failed first
+    # attempt after a fresh login would otherwise force the user to log in
+    # again next job — and repeated fresh logins from the same device are
+    # exactly the pattern LinkedIn/Workday flag.
+    if reason == "login_required" and ats_slug:
+        try:
+            from applypilot import config as _cfg
+            from applypilot.apply.chrome import save_ats_session
+            n = save_ats_session(_cfg.CHROME_WORKER_DIR / f"worker-{worker_id}", ats_slug)
+            if add_event:
+                add_event(f"[W{worker_id}] Saved {ats_slug} session ({n} files) after login")
+        except Exception:
+            logger.debug("post-login save_ats_session failed", exc_info=True)
 
     # 9b. Pop the action log POSTed by the extension during the pause and
     # format it for the agent's resume prompt (spec §4.4). If no log was

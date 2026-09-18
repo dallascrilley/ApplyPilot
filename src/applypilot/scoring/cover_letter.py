@@ -59,6 +59,15 @@ def _build_cover_letter_prompt(profile: dict) -> str:
     if real_metrics:
         metrics_hint = f"\nReal metrics to use: {', '.join(real_metrics)}"
 
+    do_not_claim = (resume_facts.get("_do_not_claim")
+                    or resume_facts.get("do_not_claim") or [])
+    do_not_claim_hint = ""
+    if do_not_claim:
+        do_not_claim_hint = (
+            "\nNEVER claim any of the following, even if the job asks for it: "
+            + "; ".join(do_not_claim) + "."
+        )
+
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
 
 STRUCTURE: 4 paragraphs. TARGET 300-400 words; MINIMUM 260 words (Jobscan 3.4x interview-rate sweet spot is 250-400). Letters under 260 words get rejected automatically.
@@ -101,7 +110,7 @@ ADDITIONAL BANNED PHRASES:
 
 FABRICATION = INSTANT REJECTION:
 The candidate's real tools are ONLY: {skills_str}.
-Do NOT mention ANY tool not in this list. If the job asks for tools not listed, talk about the work you did, not the tools.
+Do NOT mention ANY tool not in this list. If the job asks for tools not listed, talk about the work you did, not the tools.{do_not_claim_hint}
 
 Sign off: just "{sign_off_name}"
 

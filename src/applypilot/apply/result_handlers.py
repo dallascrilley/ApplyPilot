@@ -41,6 +41,51 @@ def _parse_account_created(output: str, job_url: str | None = None) -> None:
             logger.warning("Failed to parse ACCOUNT_CREATED line: %s", e)
 
 
+def _parse_external_apply_url(output: str, job_url: str | None = None) -> str | None:
+    """Persist an ``EXTERNAL_APPLY_URL:<url>`` line emitted by the agent.
+
+    LinkedIn (and other aggregators) hide the employer's real application
+    URL behind a login-gated "Apply" button. When the agent follows that
+    redirect it reports the landing URL; we store it as ``application_url``
+    so per-company caps, ATS-lane serialization, session overlay, and the
+    cover-letter employer name all work on retry — and so the enrich-time
+    ``canonicalize_application_url`` rewrite (Greenhouse iframes etc.) can
+    apply. Only http(s) URLs off the aggregator host are accepted.
+    """
+    if not job_url:
+        return None
+    from urllib.parse import urlparse
+    found: str | None = None
+    for line in output.split("\n"):
+        if "EXTERNAL_APPLY_URL:" not in line:
+            continue
+        cand = line.split("EXTERNAL_APPLY_URL:", 1)[1].strip().strip("`*\"' ")
+        if not cand.lower().startswith(("http://", "https://")):
+            continue
+        host = (urlparse(cand).hostname or "").lower()
+        if not host or host.endswith(("linkedin.com", "indeed.com", "glassdoor.com")):
+            continue
+        found = cand  # last one wins (agent may report intermediate hops)
+    if not found:
+        return None
+    try:
+        from applypilot.database import get_connection, commit_with_retry
+        from applypilot.discovery.url_normalize import canonicalize_application_url
+        canonical = canonicalize_application_url(found) or found
+        conn = get_connection()
+        conn.execute(
+            "UPDATE jobs SET application_url = ? WHERE url = ? "
+            "AND (application_url IS NULL OR application_url = '')",
+            (canonical, job_url),
+        )
+        commit_with_retry(conn)
+        logger.info("Recorded external apply URL for %s -> %s", job_url[:60], canonical[:80])
+        return canonical
+    except Exception as e:
+        logger.warning("Failed to persist EXTERNAL_APPLY_URL: %s", e)
+        return None
+
+
 def _parse_qa_lines(output: str, job_url: str | None = None,
                     ats_slug: str | None = None) -> int:
     """Parse QA: lines from agent output and store in qa_knowledge DB.

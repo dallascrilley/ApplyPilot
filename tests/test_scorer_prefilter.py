@@ -66,6 +66,29 @@ def test_customer_success_engineer_rejected():
     assert _check_ineligible(_job(title="Senior Customer Success Engineer")) is not None
 
 
+# Sales-adjacent titles are only rejected when the profile does NOT target
+# them. A solutions-engineering candidate must see these jobs.
+_SE_PROFILE = {"experience": {"target_role": "AI Solutions Engineer / Forward Deployed Engineer"}}
+_BE_PROFILE = {"experience": {"target_role": "Senior Backend Engineer"}}
+
+
+@pytest.mark.parametrize("title", [
+    "Solutions Engineer", "Cloud Solutions Engineer", "Senior Sales Engineer",
+    "Senior Presales Engineer", "Customer Success Engineer",
+])
+def test_sales_adjacent_allowed_when_profile_targets_it(title):
+    assert _check_ineligible(_job(title=title), _SE_PROFILE) is None
+
+
+@pytest.mark.parametrize("title", ["Solutions Engineer", "Senior Sales Engineer"])
+def test_sales_adjacent_rejected_for_backend_profile(title):
+    assert _check_ineligible(_job(title=title), _BE_PROFILE) is not None
+
+
+def test_seniority_reject_still_applies_for_se_profile():
+    assert _check_ineligible(_job(title="Junior Solutions Engineer"), _SE_PROFILE) is not None
+
+
 # ── Additional safe patterns (validated 2026-04-23 round 2) ─────────
 
 def test_graduate_title_rejected():

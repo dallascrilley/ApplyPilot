@@ -63,6 +63,20 @@ def _build_tailor_prompt(profile: dict) -> str:
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
 
+    # Explicit never-claim list. profile.json `resume_facts._do_not_claim`
+    # (or `do_not_claim`) — things the candidate has decided NOT to assert even
+    # when adjacent (e.g. "Kubernetes" for someone who only uses Docker).
+    do_not_claim = (resume_facts.get("_do_not_claim")
+                    or resume_facts.get("do_not_claim") or [])
+    if do_not_claim:
+        do_not_claim_block = (
+            "\n## NEVER CLAIM (explicit exclusions — overrides the adjacent-tools allowance above):\n"
+            + "\n".join(f"- {item}" for item in do_not_claim)
+            + "\nIf the job requires one of these, do NOT add it. Tailor around it.\n"
+        )
+    else:
+        do_not_claim_block = ""
+
     return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
 Take the base resume and job description. Return a tailored resume as a JSON object.
@@ -76,8 +90,8 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
-
+You MAY add 2-3 closely related tools (Terraform if AWS, Redis if PostgreSQL) ONLY if they are not on the NEVER CLAIM list. No unrelated languages/frameworks.
+{do_not_claim_block}
 ## TAILORING RULES:
 
 TITLE: Use the job title verbatim from the posting (Jobscan: 10.6x interview-rate lift). Only strip internal-req prefixes like "JREQ197053 -" and trailing team tags like "(Payments Team)". Keep the full role name including specialty — "Staff Software Engineer, AI Platform" stays as-is; "Senior Backend Engineer - Python" stays as-is.
@@ -615,13 +629,20 @@ def _tailor_one_job(job: dict, resume_text: str, profile: dict, doc_format: str 
     first, last = _name_parts(profile)
     safe_title = re.sub(r"[^\w\s-]", "", job.get("title") or "untitled")[:50].strip().replace(" ", "_")
     url_hash = hashlib.md5(job["url"].encode()).hexdigest()[:8]
-    if first and last:
-        prefix = f"{first}_{last}_{safe_title}_{url_hash}"
-    elif first:
-        prefix = f"{first}_{safe_title}_{url_hash}"
-    else:
+    # Company and date in the name so a folder of tailored files is
+    # self-describing: Dallas_Crilley_Tanium_Corporate_AI_Engineer_2026-09-18_ab12cd34.
+    company = display_company(job) or ""
+    # ATS slugs come back lowercase ("tanium", "job-boards"); title-case
+    # anything with no capitals so the filename reads as a name.
+    if company and company == company.lower():
+        company = " ".join(w.capitalize() for w in re.split(r"[\s_-]+", company) if w)
+    safe_company = re.sub(r"[^\w\s-]", "", company)[:30].strip().replace(" ", "_")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    parts = [p for p in (first, last, safe_company, safe_title, stamp, url_hash) if p]
+    if not first:
         safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-        prefix = f"{safe_site}_{safe_title}_{url_hash}"
+        parts.insert(0, safe_site)
+    prefix = "_".join(parts)
 
     txt_path = TAILORED_DIR / f"{prefix}.txt"
     txt_path.write_text(tailored, encoding="utf-8")

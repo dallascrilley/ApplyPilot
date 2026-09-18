@@ -99,6 +99,17 @@ def _build_profile_summary(profile: dict) -> str:
             if isinstance(skills, list) and skills:
                 lines.append(f"Skills ({category}): {', '.join(skills)}")
 
+    # Explicit never-claim list (profile.json resume_facts._do_not_claim).
+    # Tailor and cover letter already honor this; screening-question
+    # free text must too. Overrides the "be confident about tools" rule.
+    do_not_claim = (resume_facts.get("_do_not_claim")
+                    or resume_facts.get("do_not_claim") or [])
+    if do_not_claim:
+        lines.append("NEVER CLAIM (overrides every confidence rule below; applies to "
+                     "screening answers, free-text boxes, and any question about experience):")
+        lines.extend(f"  - {item}" for item in do_not_claim)
+        lines.append("If a question asks about one of these, answer No or describe only what is actually true.")
+
     # Title variants by company (for "most recent title" / "previous titles" questions)
     title_variants = resume_facts.get("title_variants", {})
     if title_variants:
@@ -179,6 +190,61 @@ Read the job page. Determine the work arrangement. Then decide:
 - Job requires fluency in a language the candidate doesn't speak (see Languages in profile) -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
 - Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly and let the system reject if needed.
 Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
+
+
+def _build_linkedin_listing_section(preferred_name: str, apply_email: str,
+                                    doc_format: str = "pdf") -> str:
+    """Behavioural rules for applying from a linkedin.com/jobs/view page.
+
+    Two goals, in priority order:
+      1. This is the candidate's REAL LinkedIn account, logged in once by
+         hand. Nothing here may risk it: no sign-up, no password entry, no
+         bulk actions, no racing through forms. Pace like a person reading.
+      2. Get the application in — via Easy Apply when offered, otherwise by
+         following the employer's Apply link to their ATS and reporting the
+         landing URL back (EXTERNAL_APPLY_URL) so the pipeline learns it.
+    """
+    return f"""== LINKEDIN LISTING — READ THIS FIRST ==
+You are on the candidate's personal LinkedIn account. Treat it as irreplaceable.
+
+PACE (non-negotiable — this is how the account stays healthy):
+- After the page loads: browser_wait_for time: 4 before anything else. Then scroll the description
+  in 2-3 steps (browser_evaluate "window.scrollBy(0, 500)", wait 2-3s between) as if reading it.
+  Do the LOCATION CHECK during this read.
+- Between EVERY form step (each Next/Review/Submit click): browser_wait_for time: 2 to 4. Vary it.
+- Fill one field, then snapshot, then the next. Never browser_fill_form on LinkedIn — it bypasses
+  their input handlers and is the single most common automation tell. Use browser_type per field.
+- Before Submit: browser_wait_for time: 5, snapshot, review every field, THEN click. A person
+  always pauses at the review step.
+- Total time on this job should be roughly 3-6 minutes. If you finish in under 90 seconds
+  something is wrong — you skipped reading. Finishing slowly is fine.
+
+SESSION:
+- NEVER type a LinkedIn password. NEVER create a LinkedIn account. NEVER click "Sign in with Google".
+- If the page shows a sign-in form, a "Join now" wall, a phone-verification or security-check
+  screen, or the Easy Apply button is missing AND there is a "Sign in" link in the header:
+  output RESULT:NEEDS_HUMAN:login_required:{{current_page_url}} immediately. The user logs in by hand.
+- If LinkedIn shows a CAPTCHA/puzzle at any point: RESULT:NEEDS_HUMAN:captcha:{{current_page_url}}.
+  Do NOT attempt to solve it — solving LinkedIn's own challenge from automation is a flag.
+
+WHICH APPLY BUTTON:
+- "Easy Apply" (LinkedIn logo on the button, opens a modal on the same page) → follow the LINKEDIN
+  EASY APPLY rules in FORM TRICKS. Resume: upload the {doc_format.upper()} file when offered; if LinkedIn
+  pre-selected a previously uploaded resume, replace it with the tailored one for this job.
+  Email dropdown → "{apply_email}". First name → "{preferred_name}" (fix if pre-filled differently).
+  "Follow <company>" checkbox on the final screen → leave it as LinkedIn set it; do not toggle.
+- "Apply" (external-link icon, opens a NEW TAB on the employer's site) → click it, then
+  browser_tabs action "list", select the new tab, browser_wait_for time: 3, and output this line:
+    EXTERNAL_APPLY_URL:<the new tab's full URL>
+  Then continue the application on that site using the normal rules (it is now an ATS job, not a
+  LinkedIn job — LinkedIn pacing no longer applies, ATS login/signup rules DO apply).
+  If the new tab is an SSO page, a Workday tenant, or any manual-ATS domain, still output
+  EXTERNAL_APPLY_URL first so the pipeline records it, then apply the normal rule for that site.
+- Neither button, or "Applied" badge already shown → see ALREADY APPLIED DETECTION.
+- "No longer accepting applications" → RESULT:FAILED:job_expired.
+
+NEVER on LinkedIn: message recruiters, send connection requests, follow people, like/comment,
+visit other profiles, open the jobs feed, or click "Set alert". One job page, one application."""
 
 
 def _build_salary_section(profile: dict) -> str:
@@ -636,12 +702,15 @@ def build_prompt(job: dict, tailored_resume: str,
 
     # Location variables for form field handling
     location_cfg = search_config.get("location", {})
-    location_primary = personal.get("city", location_cfg.get("primary", "Seattle"))
-    location_state = personal.get("province_state", "WA")
-    location_full = f"{location_primary}, {location_state}"  # e.g. "Seattle, WA"
+    location_primary = personal.get("city") or location_cfg.get("primary") or "your city"
+    location_state = personal.get("province_state", "")
+    location_full = f"{location_primary}, {location_state}" if location_state else location_primary
     # Acceptable office locations (excludes "Remote" which is handled separately)
     location_accept = [p for p in location_cfg.get("accept_patterns", []) if p.lower() != "remote"]
     location_accept_priority = ", ".join(location_accept) if location_accept else location_primary
+    # First few alternates after the primary city, for the office-picker example line
+    _alt_offices = [p for p in location_accept if p.lower() != location_primary.lower()][:3]
+    location_alt_offices = ", ".join(_alt_offices) if _alt_offices else "any other city on the acceptable list"
 
     # LinkedIn Easy Apply — configurable autocomplete behavior
     # linkedin_type_chars: how many leading characters to type one-by-one before
@@ -704,6 +773,15 @@ def build_prompt(job: dict, tailored_resume: str,
     prior_path_block = format_path_for_prompt(load_path(_ats_slug)) if _ats_slug else None
     prior_path_section = (prior_path_block + "\n\n") if prior_path_block else ""
 
+    # LinkedIn listing (no external application_url): the listing page is the
+    # apply entry point and the account is a real, long-lived one. Behaviour
+    # matters more than speed here — see _build_linkedin_listing_section.
+    from applypilot.apply.chrome import is_linkedin_listing
+    linkedin_section = (
+        _build_linkedin_listing_section(preferred_name, linkedin_apply_email, doc_format) + "\n\n"
+        if is_linkedin_listing(job) else ""
+    )
+
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 IMPORTANT: You are running on a REAL computer with FULL filesystem access. You are NOT in a sandbox. You CAN read/write files, upload documents, and access the local filesystem. The resume and cover letter paths below are real files on disk — use them directly.
@@ -728,7 +806,7 @@ Cover Letter {doc_format.upper()} (upload if asked): {cl_upload_path or "N/A"}
 == APPLICANT PROFILE ==
 {profile_summary}
 
-{prior_path_section}== YOUR MISSION ==
+{linkedin_section}{prior_path_section}== YOUR MISSION ==
 Submit a complete, accurate application. Use the profile and resume as source data -- adapt to fit each form's format.
 
 If something unexpected happens and these instructions don't cover it, figure it out yourself. You are autonomous. Navigate pages, read content, try buttons, explore the site. The goal is always the same: submit the application. Do whatever it takes to reach that goal.
@@ -1092,8 +1170,8 @@ RESULT:FAILED:reason -- any other failure (brief reason)
   (1) browser_type "{location_primary}" into the field (do NOT use browser_fill_form — it bypasses autocomplete).
   (2) browser_wait_for time: 2 — let autocomplete fire. Lever.co is especially slow; always wait the full 2s.
   (3) browser_snapshot — check if a dropdown/suggestion list appeared.
-  (4a) If suggestions appeared: browser_click the option that best matches "{location_full}" or "{location_full}, United States" or "{location_full}, WA, USA" or "{location_full}, WA, US". Prefer the most specific match.
-      Lever.co specifically uses the format "{location_primary}, WA, USA" — click that if present.
+  (4a) If suggestions appeared: browser_click the option that best matches "{location_full}" or "{location_full}, United States" or "{location_full}, USA" or "{location_full}, US". Prefer the most specific match.
+      Lever.co specifically uses the format "{location_full}, USA" — click that if present.
   (4b) If NO suggestions after 2s: wait another 2s and snapshot again before giving up. If still nothing, clear the field and browser_type "{location_full}, United States" in full. No autocomplete needed.
   (5) browser_snapshot to confirm the field shows the selected location before proceeding.
   Do NOT type the full city+state+country upfront — it skips autocomplete and leaves the field unvalidated.
@@ -1101,9 +1179,9 @@ RESULT:FAILED:reason -- any other failure (brief reason)
   These ask which physical or remote location you are applying for.
   Selection priority order: {location_accept_priority}, Remote.
   Strategy: (1) snapshot the available options, (2) pick the FIRST acceptable match from the priority list.
-  If "Seattle" is an option → select it. If not, try Bellevue, Kirkland, Redmond in order. If none match, try "Remote" if offered.
+  If "{location_primary}" is an option → select it. If not, try {location_alt_offices} in order. If none match, try "Remote" if offered.
   If NONE of the acceptable locations are offered and it is a required field → output RESULT:FAILED:not_eligible_location.
-  NEVER select locations outside the acceptable list (e.g. Everett, Bothell, Renton, Tacoma, or any non-US city) even if they are the only options — those roles are not eligible.
+  NEVER select locations outside the acceptable list (nearby cities that are NOT listed, or any non-US city) even if they are the only options — those roles are not eligible.
 - LINKEDIN EASY APPLY — button visibility, location, email, and first name fields:
   The LinkedIn Easy Apply flow has several non-standard behaviors — treat them specially.
 
@@ -1126,7 +1204,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)
   (3) browser_wait_for time: 1.5 — LinkedIn autocomplete can be slow.
   (4) browser_snapshot — look for a dropdown suggestion list.
   (5) browser_click the suggestion matching "{location_full}" or any variant like
-      "Seattle, Washington, United States" or "Seattle, WA" — pick the most specific match.
+      "{location_primary}, <full state name>, United States" or "{location_full}" — pick the most specific match.
   (6) browser_snapshot to confirm the field shows the selected location before proceeding.
   If the dropdown still hasn't appeared after typing all {len(_location_type_prefix)} characters, wait 2s more and snapshot again.
   If it still fails, try browser_type with a different prefix (e.g. "{location_full[:5]}") one char at a time.

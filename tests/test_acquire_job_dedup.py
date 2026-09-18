@@ -31,6 +31,11 @@ def _setup_apply_env(monkeypatch) -> None:
     monkeypatch.setattr(
         config, "get_company_limit", lambda key: (-1, 30), raising=False,
     )
+    # Pacing reads local wall-clock + a state file under ~/.applypilot; keep
+    # it out of queue-selection tests.
+    from applypilot.apply import pacing
+    monkeypatch.setattr(pacing, "check",
+                        lambda conn, surface, now=None: pacing.PacingDecision(True))
 
 
 def test_acquire_skips_job_when_other_row_already_applied(
@@ -114,26 +119,72 @@ def test_acquire_does_not_block_self(tmp_db, seed_job, monkeypatch):
     assert job["url"] == "https://www.linkedin.com/jobs/view/solo"
 
 
-def test_acquire_skips_jobs_with_null_application_url(
+def test_acquire_skips_non_linkedin_jobs_with_null_application_url(
     tmp_db, seed_job, monkeypatch
 ):
-    """Jobs without an extracted application_url must never be acquired —
-    the agent has nothing to navigate to."""
+    """Aggregator rows (Indeed etc.) without an extracted application_url
+    must never be acquired — the agent has nothing to navigate to."""
     _setup_apply_env(monkeypatch)
     from applypilot.apply.launcher import acquire_job
 
     conn = tmp_db()
     seed_job(
         conn, url_suffix="no-apply-url",
-        url="https://www.linkedin.com/jobs/view/no-apply-url",
+        url="https://www.indeed.com/viewjob?jk=no-apply-url", site="indeed",
         application_url=None,
         apply_status=None,
         fit_score=10, company="acme",
     )
     seed_job(
         conn, url_suffix="empty-apply-url",
-        url="https://www.linkedin.com/jobs/view/empty",
+        url="https://www.indeed.com/viewjob?jk=empty", site="indeed",
         application_url="",
+        apply_status=None,
+        fit_score=10, company="acme",
+    )
+
+    assert acquire_job(min_score=10, max_age_days=0) is None
+
+
+def test_acquire_allows_linkedin_listing_without_application_url(
+    tmp_db, seed_job, monkeypatch
+):
+    """LinkedIn job-view rows are applied to from the listing page itself
+    (Easy Apply / offsite Apply behind login), so a NULL application_url
+    is NOT disqualifying for them."""
+    _setup_apply_env(monkeypatch)
+    from applypilot.apply.launcher import acquire_job
+
+    conn = tmp_db()
+    seed_job(
+        conn, url_suffix="li-easy",
+        url="https://www.linkedin.com/jobs/view/4467063497", site="linkedin",
+        application_url=None,
+        apply_status=None,
+        fit_score=10, company="acme",
+    )
+
+    job = acquire_job(min_score=10, max_age_days=0)
+    assert job is not None
+    assert job["url"] == "https://www.linkedin.com/jobs/view/4467063497"
+    # Locked as in_progress, NOT parked as manual_only.
+    row = conn.execute("SELECT apply_status FROM jobs WHERE url = ?", (job["url"],)).fetchone()
+    assert row[0] == "in_progress"
+
+
+def test_acquire_rejects_linkedin_non_view_url_without_application_url(
+    tmp_db, seed_job, monkeypatch
+):
+    """Only /jobs/view/ pages are apply entry points; a LinkedIn search or
+    company page with no application_url is still not actionable."""
+    _setup_apply_env(monkeypatch)
+    from applypilot.apply.launcher import acquire_job
+
+    conn = tmp_db()
+    seed_job(
+        conn, url_suffix="li-search",
+        url="https://www.linkedin.com/jobs/search/?keywords=x", site="linkedin",
+        application_url=None,
         apply_status=None,
         fit_score=10, company="acme",
     )
@@ -152,14 +203,14 @@ def test_acquire_picks_valid_when_others_are_null(
     conn = tmp_db()
     seed_job(
         conn, url_suffix="bad-1",
-        url="https://www.linkedin.com/jobs/view/bad-1",
+        url="https://www.indeed.com/viewjob?jk=bad-1", site="indeed",
         application_url=None,
         apply_status=None,
         fit_score=10, company="acme",
     )
     seed_job(
         conn, url_suffix="bad-2",
-        url="https://www.linkedin.com/jobs/view/bad-2",
+        url="https://www.indeed.com/viewjob?jk=bad-2", site="indeed",
         application_url="",
         apply_status=None,
         fit_score=10, company="acme",

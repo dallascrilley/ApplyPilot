@@ -110,3 +110,24 @@ exclude_titles:
   - "clearance required"
   - "TS/SCI"
   - "principal scientist"
+
+# ── Apply pacing (per surface) ──────────────────────────────────────────────
+# Rate limits, randomized minimum gaps, and local active hours per apply
+# surface so the account's application rhythm looks like a person's. Surface
+# key = ATS slug from detect_ats ("linkedin", "greenhouse", "lever", ...);
+# anything without a detectable ATS uses "default". Values below are the
+# built-in defaults — omit the block entirely to use them as-is.
+pacing:
+  linkedin:                      # your real account: keep this conservative
+    max_per_hour: 5
+    max_per_day: 12
+    min_gap_seconds: 90
+    max_gap_seconds: 240         # gap is uniform in [min, max]
+    active_hours: [8, 22]        # local time, half-open [start, end)
+    active_days: [0, 1, 2, 3, 4, 5, 6]   # Mon=0 .. Sun=6
+  default:
+    max_per_hour: 12
+    max_per_day: 40
+    min_gap_seconds: 20
+    max_gap_seconds: 75
+    active_hours: [7, 23]

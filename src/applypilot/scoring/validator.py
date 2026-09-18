@@ -62,25 +62,47 @@ LLM_LEAK_PHRASES: list[str] = [
     "the following cover letter", "the letter below",
 ]
 
-# Known fabrication markers: completely unrelated tools/languages.
-# Reasonable stretches (K8s, Terraform, Redis, Kafka etc.) are ALLOWED.
+# Known fabrication markers: tools/languages that commonly get hallucinated
+# into tailored resumes. Any entry that appears in the user's own
+# ``skills_boundary`` is automatically skipped by the validator, so this list
+# is safe to keep broad — it only fires for skills the candidate does NOT have.
+# Reasonable stretches (Terraform, Redis, Kafka etc.) are deliberately omitted.
 FABRICATION_WATCHLIST: set[str] = {
-    # Languages with zero relation to the candidate's stack
-    # NOTE: "golang" removed — synonym for Go (in profile). "c#" skipped by len<=2 guard.
-    "c#", "c++", "rust", "ruby",
-    "swift", "scala", "matlab",
-    # Frameworks for wrong languages
-    # NOTE: kotlin, django, spring, angular, vue removed — all in candidate's skills_boundary.
-    # The skip logic cross-references against profile, but keeping them out avoids edge cases.
-    "rails", "svelte",
+    # Matching is whole-token (see _watchlist_hit) so "rails" does not fire on
+    # "guardrails", "scala" on "scalable", "rust" on "trust", "vue" on "revenue".
+    # "java" is still omitted: it's a legitimate standalone token inside
+    # "Java/Kotlin"-style lists but too often appears as "JavaScript" split by
+    # a tailoring model. ".net" omitted for the same reason.
+    "c#", "c++", "rust", "ruby", "swift", "scala", "matlab",
+    "kotlin", "golang", "elixir", "haskell", "clojure",
+    # Frameworks / platforms
+    "rails", "svelte", "django", "spring boot", "angular",
+    "kubernetes", "k8s", "flutter", "react native",
     # Hard lies: certifications not in profile (real certs are checked via skills_boundary)
-    "pmp", "scrum master",
+    "pmp", "scrum master", "aws certified", "cissp",
 }
 
 REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
+_WATCHLIST_RE: dict[str, re.Pattern] = {}
+
+
+def _watchlist_hit(term: str, haystack_lower: str) -> bool:
+    """Whole-token match for a watchlist entry inside lowercased text.
+
+    Tokens are delimited by anything that is not a letter/digit/+/#, so
+    "c++", "c#" and "k8s" match as units, while "rails" does not match
+    inside "guardrails" and "scala" does not match inside "scalable".
+    """
+    rx = _WATCHLIST_RE.get(term)
+    if rx is None:
+        rx = re.compile(r"(?<![a-z0-9+#])" + re.escape(term) + r"(?![a-z0-9+#])")
+        _WATCHLIST_RE[term] = rx
+    return rx.search(haystack_lower) is not None
+
 
 def _build_skills_set(profile: dict) -> set[str]:
     """Build the set of allowed skills from the profile's skills_boundary."""
@@ -148,12 +170,10 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
         for fake in FABRICATION_WATCHLIST:
-            if len(fake) <= 2:
-                continue
             # Skip if this "fabrication" is actually a real skill in the profile
-            if any(fake in skill for skill in allowed_skills):
+            if any(_watchlist_hit(fake, skill) for skill in allowed_skills):
                 continue
-            if fake in skills_text:
+            if _watchlist_hit(fake, skills_text):
                 errors.append(f"Fabricated skill: '{fake}'")
 
     # Experience: check preserved companies (warn for missing, don't hard-fail
@@ -275,20 +295,18 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     if skills_start != -1 and skills_end != -1:
         skills_block = text_lower[skills_start:skills_end]
         for fake in FABRICATION_WATCHLIST:
-            if len(fake) <= 2:
+            if any(_watchlist_hit(fake, skill) for skill in allowed_skills):
                 continue
-            if any(fake in skill for skill in allowed_skills):
-                continue
-            if fake in skills_block:
+            if _watchlist_hit(fake, skills_block):
                 errors.append(f"FABRICATED SKILL in Technical Skills: '{fake}'")
 
     # 8. Scan full document for fabrication watchlist items not in original
     if original_text:
         original_lower = original_text.lower()
         for fake in FABRICATION_WATCHLIST:
-            if len(fake) <= 2:
+            if any(_watchlist_hit(fake, skill) for skill in allowed_skills):
                 continue
-            if fake in text_lower and fake not in original_lower:
+            if _watchlist_hit(fake, text_lower) and not _watchlist_hit(fake, original_lower):
                 warnings.append(f"New tool/skill appeared: '{fake}' (not in original)")
 
     # 9. Em dashes (should be auto-fixed by sanitize_text, but safety net)

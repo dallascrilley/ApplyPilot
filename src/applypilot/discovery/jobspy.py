@@ -152,6 +152,24 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
+_NULLISH = {"", "nan", "none", "null", "nat"}
+
+
+def _cell(row, key: str) -> str | None:
+    """Read a DataFrame cell as a clean string, or None.
+
+    pandas stringifies missing values as 'nan', 'None', 'NaT' depending on
+    dtype. The old per-field ``!= "nan"`` checks let the literal string
+    'None' through — 229 LinkedIn rows had ``application_url = 'None'``
+    which passes ``IS NOT NULL`` / ``!= ''`` gates downstream.
+    """
+    v = row.get(key)
+    if v is None:
+        return None
+    s = str(v).strip()
+    return None if s.lower() in _NULLISH else s
+
+
 def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
@@ -163,31 +181,34 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         counts["new"] = 0
         counts["existing"] = 0
         for _, row in rows_iter:
-            url = str(row.get("job_url", ""))
-            if not url or url == "nan":
+            url = _cell(row, "job_url")
+            if not url:
                 continue
 
-            title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
-            _company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
-            location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
+            title = _cell(row, "title")
+            company = _cell(row, "company")
+            location_str = _cell(row, "location")
 
             # Build salary string from min/max
             salary = None
-            min_amt = row.get("min_amount")
-            max_amt = row.get("max_amount")
-            interval = str(row.get("interval", "")) if str(row.get("interval", "")) != "nan" else ""
-            currency = str(row.get("currency", "")) if str(row.get("currency", "")) != "nan" else ""
-            if min_amt and str(min_amt) != "nan":
-                if max_amt and str(max_amt) != "nan":
-                    salary = f"{currency}{int(float(min_amt)):,}-{currency}{int(float(max_amt)):,}"
-                else:
-                    salary = f"{currency}{int(float(min_amt)):,}"
-                if interval:
-                    salary += f"/{interval}"
+            min_amt = _cell(row, "min_amount")
+            max_amt = _cell(row, "max_amount")
+            interval = _cell(row, "interval") or ""
+            currency = _cell(row, "currency") or ""
+            if min_amt:
+                try:
+                    if max_amt:
+                        salary = f"{currency}{int(float(min_amt)):,}-{currency}{int(float(max_amt)):,}"
+                    else:
+                        salary = f"{currency}{int(float(min_amt)):,}"
+                    if interval:
+                        salary += f"/{interval}"
+                except ValueError:
+                    salary = None
 
-            description = str(row.get("description", "")) if str(row.get("description", "")) != "nan" else None
-            site_name = str(row.get("site", source_label))
-            is_remote = row.get("is_remote", False)
+            description = _cell(row, "description")
+            site_name = _cell(row, "site") or source_label
+            is_remote = bool(row.get("is_remote", False)) and str(row.get("is_remote")).lower() not in _NULLISH
 
             site_label = f"{site_name}"
             if is_remote:
@@ -203,12 +224,14 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
                 detail_scraped_at = now
 
             # Extract apply URL if JobSpy provided it
-            apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+            apply_url = _cell(row, "job_url_direct")
+            if apply_url and not apply_url.lower().startswith(("http://", "https://")):
+                apply_url = None
 
             # Capture posting date if available
             date_posted_raw = row.get("date_posted")
             posted_at = None
-            if date_posted_raw and str(date_posted_raw) not in ("nan", "None", ""):
+            if _cell(row, "date_posted"):
                 try:
                     dp = date_posted_raw
                     if hasattr(dp, "isoformat"):
@@ -222,10 +245,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
             try:
                 conn.execute(
-                    "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
+                    "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
                     "full_description, application_url, detail_scraped_at, posted_at, state) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (url, title, salary, description, location_str, site_label, strategy, now,
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (url, title, company, salary, description, location_str, site_label, strategy, now,
                      full_description, apply_url, detail_scraped_at, posted_at, initial_state),
                 )
                 conn.execute(
@@ -340,8 +363,7 @@ def _run_one_search(
     # Filter by location before storing
     before = len(df)
     df = df[df.apply(lambda row: _location_ok(
-        str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None,
-        accept_locs, reject_locs,
+        _cell(row, "location"), accept_locs, reject_locs,
     ), axis=1)]
     filtered = before - len(df)
 

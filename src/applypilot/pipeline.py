@@ -281,14 +281,19 @@ def _run_enrich(workers: int = 1) -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_score(workers: int = 1, max_age_days: int | None = None) -> dict:
-    """Stage: LLM scoring — assign fit scores 1-10."""
+def _run_score(workers: int = 1, max_age_days: int | None = None,
+               limit: int = 0) -> dict:
+    """Stage: LLM scoring — assign fit scores 1-10.
+
+    ``limit`` caps jobs scored this run (0 = all pending). Useful for a
+    calibration pass before spending on the whole queue.
+    """
     from applypilot.config import DEFAULTS
     if max_age_days is None:
         max_age_days = DEFAULTS["max_job_age_days"]
     try:
         from applypilot.scoring.scorer import run_scoring
-        run_scoring(workers=workers, max_age_days=max_age_days)
+        run_scoring(limit=limit or 0, workers=workers, max_age_days=max_age_days)
         return {"status": "ok"}
     except Exception as e:
         log.exception("Scoring failed: %s", e)
@@ -480,6 +485,7 @@ def _run_stage_streaming(
     workers: int = 1,
     sources: list[str] | None = None,
     doc_format: str = "docx",
+    score_limit: int = 0,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -499,6 +505,8 @@ def _run_stage_streaming(
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
         kwargs["limit"] = limit
+    if stage == "score" and score_limit:
+        kwargs["limit"] = score_limit
     if stage in ("discover", "enrich", "score", "tailor", "cover"):
         kwargs["workers"] = workers
     if stage == "discover" and sources is not None:
@@ -579,6 +587,7 @@ def _run_sequential(
     workers: int = 1,
     sources: list[str] | None = None,
     doc_format: str = "docx",
+    score_limit: int = 0,
 ) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
@@ -602,6 +611,8 @@ def _run_sequential(
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["limit"] = limit
+            if name == "score" and score_limit:
+                kwargs["limit"] = score_limit
             if name in ("discover", "enrich", "score", "tailor", "cover"):
                 kwargs["workers"] = workers
             if name == "discover" and sources is not None:
@@ -641,7 +652,8 @@ def _run_sequential(
 def _run_streaming(ordered: list[str], min_score: int,
                    max_age_days: int | None = None,
                    limit: int = 20, workers: int = 1,
-                   sources: list[str] | None = None, doc_format: str = "docx") -> dict:
+                   sources: list[str] | None = None, doc_format: str = "docx",
+                   score_limit: int = 0) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -663,7 +675,7 @@ def _run_streaming(ordered: list[str], min_score: int,
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, max_age_days, limit, workers, sources, doc_format),
+            args=(name, tracker, stop_event, min_score, max_age_days, limit, workers, sources, doc_format, score_limit),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -748,6 +760,9 @@ def run_pipeline(
         stages = ["all"]
     ordered = _resolve_stages(stages)
     effective_limit = limit if limit is not None else 20
+    # Score has no default cap (scores everything pending); an explicit
+    # --limit applies to it too so a calibration pass is possible.
+    score_limit = limit if limit is not None else 0
 
     # Banner
     mode = "streaming" if stream else "sequential"
@@ -785,12 +800,14 @@ def run_pipeline(
             result = _run_streaming(ordered, min_score,
                                     max_age_days=max_age_days,
                                     limit=effective_limit, workers=workers,
-                                    sources=sources, doc_format=doc_format)
+                                    sources=sources, doc_format=doc_format,
+                                    score_limit=score_limit)
         else:
             result = _run_sequential(ordered, min_score,
                                      max_age_days=max_age_days,
                                      limit=effective_limit, workers=workers,
-                                     sources=sources, doc_format=doc_format)
+                                     sources=sources, doc_format=doc_format,
+                                     score_limit=score_limit)
     finally:
         # Always remove file handler, even on crash
         if file_handler:

@@ -96,7 +96,7 @@ def run(
             f"Default: {config.DEFAULTS['max_job_age_days']}."
         ),
     ),
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max jobs per stage (tailor/cover). Default: 20."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max jobs per stage. tailor/cover default 20; score defaults to all pending."),
     workers: int = typer.Option(
         1, "--workers", "-w",
         help="Parallel threads for Workday/smart-extract stages. (JobSpy runs sequentially regardless.)",
@@ -312,7 +312,7 @@ def apply(
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, max_score=max_score, model=model)
+        prompt_file = gen_prompt(target, min_score=min_score, max_score=max_score, model=model, dry_run=dry_run)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)

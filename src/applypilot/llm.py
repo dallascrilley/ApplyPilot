@@ -2,10 +2,11 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY    -> Google Gemini (primary)
+  DEEPSEEK_API_KEY  -> DeepSeek (primary; deepseek-flash [V4.1] fast, deepseek-v4-pro quality)
+  GEMINI_API_KEY    -> Google Gemini (fallback)
   OPENAI_API_KEY    -> OpenAI (fallback)
   ANTHROPIC_API_KEY -> Anthropic (fallback)
-  LLM_URL           -> Local llama.cpp / Ollama compatible endpoint
+  LLM_URL           -> Local llama.cpp / Ollama compatible endpoint (overrides all)
 
 LLM_MODEL env var overrides the default (fast) model for any provider.
 LLM_MODEL_QUALITY env var sets a higher-quality model for critical steps
@@ -41,7 +42,7 @@ class ModelEntry:
 def _build_fallback_chain(primary_model: str, quality: bool = False) -> list[ModelEntry]:
     """Build a cross-provider fallback chain starting from the primary model.
 
-    Gemini models come first (free tier), then OpenAI (cheap), then Anthropic.
+    DeepSeek comes first (cheap, primary), then Gemini, OpenAI, Anthropic.
     Only includes providers whose API keys are configured.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
@@ -53,18 +54,23 @@ def _build_fallback_chain(primary_model: str, quality: bool = False) -> list[Mod
     anthropic_url = "https://api.anthropic.com"
     deepseek_url = "https://api.deepseek.com/v1"
 
-    # Gemini chains — use verified model IDs only
+    # Gemini chains. Newest first; a 404 on an unknown/unavailable model ID
+    # marks it exhausted and falls through to the next entry, so listing a
+    # not-yet-GA model at the head is safe. gemini-2.0-* is deprecated for
+    # new API keys and has been removed.
     if quality:
         gemini_models = [
+            "gemini-3.8-pro",
+            "gemini-3.8-flash",
             "gemini-2.5-pro",
             "gemini-2.5-flash",
-            "gemini-2.0-flash",
         ]
     else:
         gemini_models = [
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
             "gemini-2.5-flash",
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash-lite",
         ]
 
     # OpenAI fallbacks (cost-efficient)
@@ -79,38 +85,44 @@ def _build_fallback_chain(primary_model: str, quality: bool = False) -> list[Mod
     else:
         anthropic_models = ["claude-haiku-4-5-20251001"]
 
+    # DeepSeek (primary). Per api-docs.deepseek.com "Your First API Call"
+    # (2026-09): "deepseek-flash" is the current ID and is served by
+    # DeepSeek-V4.1-Flash; the legacy "deepseek-v4-flash" alias is still
+    # accepted (routes to the same 4.1 model at Flash pricing). "deepseek-v4-pro"
+    # remains available after Sept 2026. All are reasoning models with 1M
+    # context / 384K max output. LLM_MODEL / LLM_MODEL_QUALITY can put any
+    # DeepSeek ID at the head of the chain.
+    if quality:
+        deepseek_models = ["deepseek-v4-pro", "deepseek-flash", "deepseek-chat"]
+    else:
+        deepseek_models = ["deepseek-flash", "deepseek-v4-flash", "deepseek-chat"]
+
     chain: list[ModelEntry] = []
 
-    # Start from the primary model in the Gemini chain
-    if gemini_key:
-        started = False
-        for m in gemini_models:
-            if m == primary_model:
-                started = True
-            if started:
-                chain.append(ModelEntry(m, "gemini", gemini_url, gemini_key))
-        # If primary wasn't found in chain, add full chain
-        if not started:
-            chain.append(ModelEntry(primary_model, "gemini", gemini_url, gemini_key))
-            for m in gemini_models:
-                if m != primary_model:
-                    chain.append(ModelEntry(m, "gemini", gemini_url, gemini_key))
+    def _extend_provider(models: list[str], provider: str, url: str, key: str) -> None:
+        """Append ``models`` for ``provider``; if ``primary_model`` belongs to
+        this provider, start from it (prepending it when it isn't in the list)."""
+        if primary_model in models:
+            ordered = models[models.index(primary_model):]
+        elif _model_provider(primary_model) == provider:
+            ordered = [primary_model] + [m for m in models if m != primary_model]
+        else:
+            ordered = models
+        for m in ordered:
+            if not any(e.name == m and e.provider == provider for e in chain):
+                chain.append(ModelEntry(m, provider, url, key))
 
-    # DeepSeek fallbacks (cheap, OpenAI-compatible)
-    if quality:
-        deepseek_models = ["deepseek-chat"]
-    else:
-        deepseek_models = ["deepseek-chat"]
+    if deepseek_key:
+        _extend_provider(deepseek_models, "deepseek", deepseek_url, deepseek_key)
+
+    # Gemini chain
+    if gemini_key:
+        _extend_provider(gemini_models, "gemini", gemini_url, gemini_key)
 
     # OpenAI fallbacks
     if openai_key:
         for m in openai_models:
             chain.append(ModelEntry(m, "openai", openai_url, openai_key))
-
-    # DeepSeek fallbacks
-    if deepseek_key:
-        for m in deepseek_models:
-            chain.append(ModelEntry(m, "deepseek", deepseek_url, deepseek_key))
 
     # Anthropic fallbacks
     if anthropic_key:
@@ -131,8 +143,26 @@ def _build_fallback_chain(primary_model: str, quality: bool = False) -> list[Mod
 # Provider detection (for primary model selection)
 # ---------------------------------------------------------------------------
 
+def _model_provider(model: str) -> str:
+    """Best-effort provider inference from a model ID."""
+    m = model.lower()
+    if m.startswith("deepseek"):
+        return "deepseek"
+    if m.startswith("gemini"):
+        return "gemini"
+    if m.startswith(("gpt", "o1", "o3", "o4")):
+        return "openai"
+    if m.startswith("claude"):
+        return "anthropic"
+    return ""
+
+
 def _detect_provider(quality: bool = False) -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) for the primary provider."""
+    """Return (base_url, model, api_key) for the primary provider.
+
+    Priority: LLM_URL (local) > DeepSeek > Gemini > OpenAI.
+    """
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
@@ -145,10 +175,16 @@ def _detect_provider(quality: bool = False) -> tuple[str, str, str]:
     else:
         chosen_model = model_override
 
+    if deepseek_key and not local_url:
+        return (
+            "https://api.deepseek.com/v1",
+            chosen_model or ("deepseek-v4-pro" if quality else "deepseek-flash"),
+            deepseek_key,
+        )
     if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            chosen_model or "gemini-2.5-flash",
+            chosen_model or "gemini-3.8-flash",
             gemini_key,
         )
     if openai_key and not local_url:
@@ -165,7 +201,7 @@ def _detect_provider(quality: bool = False) -> tuple[str, str, str]:
         )
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL."
+        "Set DEEPSEEK_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL."
     )
 
 
@@ -247,9 +283,17 @@ class LLMClient:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {entry.api_key}",
         }
-        # DeepSeek deepseek-chat has an 8192 max output token limit
         if entry.provider == "deepseek":
-            max_tokens = min(max_tokens, 8192)
+            if entry.name in ("deepseek-chat", "deepseek-reasoner"):
+                # Legacy V3-era IDs cap output at 8192.
+                max_tokens = min(max_tokens, 8192)
+            else:
+                # deepseek-flash (V4.1) / deepseek-v4-* are reasoning models:
+                # thinking tokens share the max_tokens budget with the visible
+                # answer (same gotcha as Gemini 2.5). Give a generous floor so
+                # a scoring call asking for 8192 doesn't get its answer
+                # truncated by the reasoning trace. Output cap is 384K.
+                max_tokens = max(max_tokens, 16384)
         payload = {
             "model": entry.name,
             "messages": messages,
@@ -331,16 +375,28 @@ class LLMClient:
                         f"Malformed response from {entry.provider}/{entry.name}: "
                         f"no choices in {type(data).__name__}"
                     )
-                text = data["choices"][0]["message"]["content"]
-                if text is None:
-                    # Model returned null content (refusal, tool_call, etc.)
+                choice = data["choices"][0]
+                text = choice.get("message", {}).get("content")
+                finish = choice.get("finish_reason")
+                if finish == "length":
+                    # Budget exhausted. On reasoning models (DeepSeek V4/4.1, o-series)
+                    # this usually means thinking consumed max_tokens and the visible
+                    # answer is empty or cut mid-JSON. Surface it loudly.
+                    usage = data.get("usage") or {}
+                    log.warning("%s/%s: finish_reason=length (max_tokens=%d, completion_tokens=%s, "
+                                "reasoning_tokens=%s) — output truncated",
+                                entry.provider, entry.name, max_tokens,
+                                usage.get("completion_tokens"),
+                                (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"))
+                if text is None or (not text.strip() and finish != "stop"):
+                    # Null/empty content (refusal, tool_call, or reasoning ate the budget)
                     if not is_last:
-                        log.warning("%s/%s: null content in response, trying next",
-                                    entry.provider, entry.name)
+                        log.warning("%s/%s: empty content in response (finish_reason=%s), trying next",
+                                    entry.provider, entry.name, finish)
                         return None
                     raise RuntimeError(
-                        f"Null content from {entry.provider}/{entry.name} "
-                        f"(refusal: {data['choices'][0]['message'].get('refusal', 'none')})"
+                        f"Empty content from {entry.provider}/{entry.name} "
+                        f"(finish_reason={finish}, refusal: {choice.get('message', {}).get('refusal', 'none')})"
                     )
 
                 if entry.name != self.model:
